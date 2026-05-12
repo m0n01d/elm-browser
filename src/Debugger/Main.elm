@@ -65,6 +65,8 @@ type alias Model model msg =
   , state : State model msg
   , expandoModel : Expando
   , expandoMsg : Expando
+  , maybeDiff : Maybe Expando.Diff
+  , diffFlip : Bool
   , metadata : Result Metadata.Error Metadata
   , overlay : Overlay.State
   , popout : Popout
@@ -153,6 +155,8 @@ wrapInit metadata popout init flags =
     , state = Running userModel
     , expandoModel = Expando.init userModel
     , expandoMsg = Expando.init ()
+    , maybeDiff = Nothing
+    , diffFlip = False
     , metadata = Metadata.decode metadata
     , overlay = Overlay.none
     , popout = popout
@@ -244,6 +248,7 @@ wrapUpdate update msg model =
                     | state = Running userModel
                     , expandoMsg = Expando.merge userMsg model.expandoMsg
                     , expandoModel = Expando.merge userModel model.expandoModel
+                    , maybeDiff = Nothing
                   }
                 , scroll model.popout
                 )
@@ -341,11 +346,19 @@ jumpUpdate update index model =
 
         ( indexModel, indexMsg ) =
             History.get update index history
+
+        newExpandoModel =
+            Expando.merge indexModel model.expandoModel
+
+        newDiff =
+            Expando.computeDiff model.expandoModel newExpandoModel
     in
     { model
         | state = Paused index indexModel currentModel currentMsg history
-        , expandoModel = Expando.merge indexModel model.expandoModel
+        , expandoModel = newExpandoModel
         , expandoMsg = Expando.merge indexMsg model.expandoMsg
+        , maybeDiff = Just newDiff
+        , diffFlip = not model.diffFlip
     }
 
 
@@ -452,6 +465,8 @@ loadNewHistory rawHistory update model =
                 , state = Running latestUserModel
                 , expandoModel = Expando.init latestUserModel
                 , expandoMsg = Expando.init (History.getRecentMsg newHistory)
+                , maybeDiff = Nothing
+                , diffFlip = False
                 , overlay = Overlay.none
               }
             , Cmd.none
@@ -509,10 +524,43 @@ popoutView model =
       , style "flex-direction" (toFlexDirection model.layout)
       ]
     )
-    [ viewHistory maybeIndex historyToRender model.layout
+    [ node "style" [] [ text debuggerChangedCss ]
+    , viewHistory maybeIndex historyToRender model.layout
     , viewDragZone model.layout
-    , viewExpando model.expandoMsg model.expandoModel model.layout
+    , viewExpando model.expandoMsg model.expandoModel model.maybeDiff model.diffFlip model.layout
     ]
+
+
+debuggerChangedCss : String
+debuggerChangedCss =
+  """
+@keyframes elm-debugger-flash {
+  0% {
+    background-color: rgba(0, 119, 204, 0.45);
+    box-shadow: inset 4px 0 0 rgba(0, 119, 204, 1),
+                0 0 0 2px rgba(0, 119, 204, 0.35),
+                0 3px 12px rgba(0, 119, 204, 0.4);
+  }
+  100% {
+    background-color: rgba(0, 119, 204, 0.14);
+    box-shadow: inset 4px 0 0 rgba(0, 119, 204, 0.9),
+                0 2px 8px rgba(0, 119, 204, 0.22);
+  }
+}
+.elm-debugger-changed {
+  background-color: rgba(0, 119, 204, 0.14);
+  box-shadow: inset 4px 0 0 rgba(0, 119, 204, 0.9),
+              0 2px 8px rgba(0, 119, 204, 0.22);
+  animation: elm-debugger-flash 0.75s ease-out;
+  border-radius: 3px;
+  padding-top: 2px;
+  padding-bottom: 2px;
+}
+.elm-debugger-changed-ancestor {
+  background-color: rgba(0, 119, 204, 0.05);
+  box-shadow: inset 2px 0 0 rgba(0, 119, 204, 0.22);
+}
+"""
 
 
 toFlexDirection : Layout -> String
@@ -768,8 +816,8 @@ toHistoryIcon layout =
 -- VIEW EXPANDO
 
 
-viewExpando : Expando -> Expando -> Layout -> Html (Msg msg)
-viewExpando expandoMsg expandoModel layout =
+viewExpando : Expando -> Expando -> Maybe Expando.Diff -> Bool -> Layout -> Html (Msg msg)
+viewExpando expandoMsg expandoModel maybeDiff diffFlip layout =
   let
     (w,h) = toExpandoPercents layout
     block = toMouseBlocker layout
@@ -788,9 +836,9 @@ viewExpando expandoMsg expandoModel layout =
     , style "user-select" block
     ]
     [ div [ style "color" "#ccc", style "padding" "0 0 1em 0" ] [ text "-- MESSAGE" ]
-    , Html.map TweakExpandoMsg <| Expando.view Nothing expandoMsg
+    , Html.map TweakExpandoMsg <| Expando.view Nothing expandoMsg Nothing False
     , div [ style "color" "#ccc", style "padding" "1em 0" ] [ text "-- MODEL" ]
-    , Html.map TweakExpandoModel <| Expando.view Nothing expandoModel
+    , Html.map TweakExpandoModel <| Expando.view Nothing expandoModel maybeDiff diffFlip
     ]
 
 

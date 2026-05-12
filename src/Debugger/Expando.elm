@@ -1,8 +1,10 @@
 module Debugger.Expando exposing
   ( Expando
+  , Diff
   , Msg
   , init
   , merge
+  , computeDiff
   , update
   , view
   )
@@ -13,6 +15,7 @@ import Elm.Kernel.Debugger
 import Html exposing (Html, div, span, text)
 import Html.Attributes exposing (class, style)
 import Html.Events exposing (onClick)
+import Html.Keyed
 import Json.Decode as Json
 
 
@@ -46,6 +49,121 @@ seqTypeToString n seqType =
 
     ArraySeq ->
       "Array(" ++ String.fromInt n ++ ")"
+
+
+
+-- DIFF
+
+
+type Diff
+  = Same
+  | Changed
+  | DiffRecord (Dict String Diff)
+  | DiffSequence (List Diff)
+  | DiffDictionary (List ( Diff, Diff ))
+  | DiffConstructor (List Diff)
+
+
+computeDiff : Expando -> Expando -> Diff
+computeDiff old new =
+  case ( old, new ) of
+    ( S a, S b ) ->
+      if a == b then Same else Changed
+
+    ( Primitive a, Primitive b ) ->
+      if a == b then Same else Changed
+
+    ( Sequence _ _ aItems, Sequence _ _ bItems ) ->
+      let
+        paired = List.map2 computeDiff aItems bItems
+        extras = List.repeat (max 0 (List.length bItems - List.length aItems)) Changed
+        diffs  = paired ++ extras
+      in
+      if List.all ((==) Same) diffs then Same else DiffSequence diffs
+
+    ( Dictionary _ aKvs, Dictionary _ bKvs ) ->
+      let
+        pairDiff ( ok, ov ) ( nk, nv ) = ( computeDiff ok nk, computeDiff ov nv )
+        paired = List.map2 pairDiff aKvs bKvs
+        extras = List.repeat (max 0 (List.length bKvs - List.length aKvs)) ( Changed, Changed )
+        diffs  = paired ++ extras
+        allSame = List.all (\( dk, dv ) -> dk == Same && dv == Same) diffs
+      in
+      if allSame then Same else DiffDictionary diffs
+
+    ( Record _ aFields, Record _ bFields ) ->
+      let
+        diffField key bVal =
+          case Dict.get key aFields of
+            Nothing   -> Changed
+            Just aVal -> computeDiff aVal bVal
+        diffs   = Dict.map diffField bFields
+        allSame = List.all ((==) Same) (Dict.values diffs)
+      in
+      if allSame then Same else DiffRecord diffs
+
+    ( Constructor aName _ aArgs, Constructor bName _ bArgs ) ->
+      if aName /= bName then
+        Changed
+      else
+        let
+          paired = List.map2 computeDiff aArgs bArgs
+          extras = List.repeat (max 0 (List.length bArgs - List.length aArgs)) Changed
+          diffs  = paired ++ extras
+        in
+        if List.all ((==) Same) diffs then Same else DiffConstructor diffs
+
+    _ ->
+      Changed
+
+
+-- Extract the diff for item i in a sequence or constructor arg list
+itemDiff : Int -> Maybe Diff -> Maybe Diff
+itemDiff i maybeDiff =
+  case maybeDiff of
+    Just (DiffSequence diffs) ->
+      List.head (List.drop i diffs)
+
+    Just (DiffConstructor diffs) ->
+      List.head (List.drop i diffs)
+
+    _ ->
+      Nothing
+
+
+-- Extract the diff for a named record field
+fieldDiff : String -> Maybe Diff -> Maybe Diff
+fieldDiff key maybeDiff =
+  case maybeDiff of
+    Just (DiffRecord diffs) ->
+      Dict.get key diffs
+
+    _ ->
+      Nothing
+
+
+-- Extract (keyDiff, valDiff) for a dict entry at index i
+dictKVDiff : Int -> Maybe Diff -> ( Maybe Diff, Maybe Diff )
+dictKVDiff i maybeDiff =
+  case maybeDiff of
+    Just (DiffDictionary diffs) ->
+      case List.drop i diffs of
+        ( dk, dv ) :: _ -> ( Just dk, Just dv )
+        []              -> ( Nothing, Nothing )
+
+    _ ->
+      ( Nothing, Nothing )
+
+
+-- Return the CSS class for a node.
+-- Leaf nodes that are `Just Changed` use Html.Keyed for DOM recreation instead of this.
+changedClass : Maybe Diff -> Html.Attribute msg
+changedClass maybeDiff =
+  case maybeDiff of
+    Just Changed -> class "elm-debugger-changed"
+    Just Same    -> class ""
+    Just _       -> class "elm-debugger-changed-ancestor"
+    Nothing      -> class ""
 
 
 
@@ -287,81 +405,95 @@ updateField msg maybeExpando =
 -- VIEW
 
 
-view : Maybe String -> Expando -> Html Msg
-view maybeKey expando =
+view : Maybe String -> Expando -> Maybe Diff -> Bool -> Html Msg
+view maybeKey expando maybeDiff flip =
   case expando of
     S stringRep ->
-      div (leftPad maybeKey) (lineStarter maybeKey Nothing [ span [ red ] [ text stringRep ] ])
+      let content = lineStarter maybeKey Nothing [ span [ red ] [ text stringRep ] ]
+      in
+      case maybeDiff of
+        Just Changed ->
+          Html.Keyed.node "div" (leftPad maybeKey)
+            [ ( if flip then "1" else "0", div [ class "elm-debugger-changed" ] content ) ]
+        _ ->
+          div (leftPad maybeKey ++ [ changedClass maybeDiff ]) content
 
     Primitive stringRep ->
-      div (leftPad maybeKey) (lineStarter maybeKey Nothing [ span [ blue ] [ text stringRep ] ])
+      let content = lineStarter maybeKey Nothing [ span [ blue ] [ text stringRep ] ]
+      in
+      case maybeDiff of
+        Just Changed ->
+          Html.Keyed.node "div" (leftPad maybeKey)
+            [ ( if flip then "1" else "0", div [ class "elm-debugger-changed" ] content ) ]
+        _ ->
+          div (leftPad maybeKey ++ [ changedClass maybeDiff ]) content
 
     Sequence seqType isClosed valueList ->
-      viewSequence maybeKey seqType isClosed valueList
+      viewSequence maybeKey seqType isClosed valueList maybeDiff flip
 
     Dictionary isClosed keyValuePairs ->
-      viewDictionary maybeKey isClosed keyValuePairs
+      viewDictionary maybeKey isClosed keyValuePairs maybeDiff flip
 
     Record isClosed valueDict ->
-      viewRecord maybeKey isClosed valueDict
+      viewRecord maybeKey isClosed valueDict maybeDiff flip
 
     Constructor maybeName isClosed valueList ->
-      viewConstructor maybeKey maybeName isClosed valueList
+      viewConstructor maybeKey maybeName isClosed valueList maybeDiff flip
 
 
 
 -- VIEW SEQUENCE
 
 
-viewSequence : Maybe String -> SeqType -> Bool -> List Expando -> Html Msg
-viewSequence maybeKey seqType isClosed valueList =
+viewSequence : Maybe String -> SeqType -> Bool -> List Expando -> Maybe Diff -> Bool -> Html Msg
+viewSequence maybeKey seqType isClosed valueList maybeDiff flip =
   let
     starter = seqTypeToString (List.length valueList) seqType
   in
-  div (leftPad maybeKey)
+  div (leftPad maybeKey ++ [ changedClass maybeDiff ])
     [ div [ onClick Toggle ] (lineStarter maybeKey (Just isClosed) [ text starter ])
-    , if isClosed then text "" else viewSequenceOpen valueList
+    , if isClosed then text "" else viewSequenceOpen valueList maybeDiff flip
     ]
 
 
-viewSequenceOpen : List Expando -> Html Msg
-viewSequenceOpen values =
-  div [] (List.indexedMap viewConstructorEntry values)
+viewSequenceOpen : List Expando -> Maybe Diff -> Bool -> Html Msg
+viewSequenceOpen values maybeDiff flip =
+  div [] (List.indexedMap (\i v -> viewConstructorEntry i v (itemDiff i maybeDiff) flip) values)
 
 
 
 -- VIEW DICTIONARY
 
 
-viewDictionary : Maybe String -> Bool -> List (Expando, Expando) -> Html Msg
-viewDictionary maybeKey isClosed keyValuePairs =
+viewDictionary : Maybe String -> Bool -> List (Expando, Expando) -> Maybe Diff -> Bool -> Html Msg
+viewDictionary maybeKey isClosed keyValuePairs maybeDiff flip =
   let
     starter = "Dict(" ++ String.fromInt (List.length keyValuePairs) ++ ")"
   in
-  div (leftPad maybeKey)
+  div (leftPad maybeKey ++ [ changedClass maybeDiff ])
     [ div [ onClick Toggle ] (lineStarter maybeKey (Just isClosed) [ text starter ])
-    , if isClosed then text "" else viewDictionaryOpen keyValuePairs
+    , if isClosed then text "" else viewDictionaryOpen keyValuePairs maybeDiff flip
     ]
 
 
-viewDictionaryOpen : List (Expando, Expando) -> Html Msg
-viewDictionaryOpen keyValuePairs =
-  div [] (List.indexedMap viewDictionaryEntry keyValuePairs)
+viewDictionaryOpen : List (Expando, Expando) -> Maybe Diff -> Bool -> Html Msg
+viewDictionaryOpen keyValuePairs maybeDiff flip =
+  div [] (List.indexedMap (\i kv -> viewDictionaryEntry i kv (dictKVDiff i maybeDiff) flip) keyValuePairs)
 
 
-viewDictionaryEntry : Int -> (Expando, Expando) -> Html Msg
-viewDictionaryEntry index ( key, value ) =
+viewDictionaryEntry : Int -> (Expando, Expando) -> ( Maybe Diff, Maybe Diff ) -> Bool -> Html Msg
+viewDictionaryEntry index ( key, value ) ( kDiff, vDiff ) flip =
   case key of
     S stringRep ->
-      Html.map (Index Value index) (view (Just stringRep) value)
+      Html.map (Index Value index) (view (Just stringRep) value vDiff flip)
 
     Primitive stringRep ->
-      Html.map (Index Value index) (view (Just stringRep) value)
+      Html.map (Index Value index) (view (Just stringRep) value vDiff flip)
 
     _ ->
       div []
-        [ Html.map (Index Key index) (view (Just "key") key)
-        , Html.map (Index Value index) (view (Just "value") value)
+        [ Html.map (Index Key index) (view (Just "key") key kDiff flip)
+        , Html.map (Index Value index) (view (Just "value") value vDiff flip)
         ]
 
 
@@ -369,38 +501,38 @@ viewDictionaryEntry index ( key, value ) =
 -- VIEW RECORD
 
 
-viewRecord : Maybe String -> Bool -> Dict String Expando -> Html Msg
-viewRecord maybeKey isClosed record =
+viewRecord : Maybe String -> Bool -> Dict String Expando -> Maybe Diff -> Bool -> Html Msg
+viewRecord maybeKey isClosed record maybeDiff flip =
   let
     (start, middle, end) =
       if isClosed then
         (Tuple.second (viewTinyRecord record), text "", text "")
       else
-        ([ text "{" ], viewRecordOpen record, div (leftPad (Just ())) [ text "}" ])
+        ([ text "{" ], viewRecordOpen record maybeDiff flip, div (leftPad (Just ())) [ text "}" ])
   in
-  div (leftPad maybeKey)
+  div (leftPad maybeKey ++ [ changedClass maybeDiff ])
     [ div [ onClick Toggle ] (lineStarter maybeKey (Just isClosed) start)
     , middle
     , end
     ]
 
 
-viewRecordOpen : Dict String Expando -> Html Msg
-viewRecordOpen record =
-  div [] (List.map viewRecordEntry (Dict.toList record))
+viewRecordOpen : Dict String Expando -> Maybe Diff -> Bool -> Html Msg
+viewRecordOpen record maybeDiff flip =
+  div [] (List.map (\( k, v ) -> viewRecordEntry k v (fieldDiff k maybeDiff) flip) (Dict.toList record))
 
 
-viewRecordEntry : ( String, Expando ) -> Html Msg
-viewRecordEntry ( field, value ) =
-  Html.map (Field field) (view (Just field) value)
+viewRecordEntry : String -> Expando -> Maybe Diff -> Bool -> Html Msg
+viewRecordEntry field value fDiff flip =
+  Html.map (Field field) (view (Just field) value fDiff flip)
 
 
 
 -- VIEW CONSTRUCTOR
 
 
-viewConstructor : Maybe String -> Maybe String -> Bool -> List Expando -> Html Msg
-viewConstructor maybeKey maybeName isClosed valueList =
+viewConstructor : Maybe String -> Maybe String -> Bool -> List Expando -> Maybe Diff -> Bool -> Html Msg
+viewConstructor maybeKey maybeName isClosed valueList maybeDiff flip =
   let
     tinyArgs = List.map (Tuple.second << viewExtraTiny) valueList
 
@@ -410,6 +542,8 @@ viewConstructor maybeKey maybeName isClosed valueList =
         (Nothing  , x :: xs) -> text "( " :: span [] x :: List.foldr (\args rest -> text ", " :: span [] args :: rest) [ text " )" ] xs
         (Just name, []     ) -> [ text name ]
         (Just name, x :: xs) -> text (name ++ " ") :: span [] x :: List.foldr (\args rest -> text " " :: span [] args :: rest) [] xs
+
+    arg0Diff = itemDiff 0 maybeDiff
 
     (maybeIsClosed, openHtml) =
         case valueList of
@@ -427,46 +561,68 @@ viewConstructor maybeKey maybeName isClosed valueList =
               Sequence _ _ subValueList ->
                 ( Just isClosed
                 , if isClosed then div [] [] else
-                    Html.map (Index None 0) (viewSequenceOpen subValueList)
+                    Html.map (Index None 0) (viewSequenceOpen subValueList arg0Diff flip)
                 )
 
               Dictionary _ keyValuePairs ->
                 ( Just isClosed
                 , if isClosed then div [] [] else
-                    Html.map (Index None 0) (viewDictionaryOpen keyValuePairs)
+                    Html.map (Index None 0) (viewDictionaryOpen keyValuePairs arg0Diff flip)
                 )
 
               Record _ record ->
                   ( Just isClosed
                   , if isClosed then div [] [] else
-                      Html.map (Index None 0) (viewRecordOpen record)
+                      Html.map (Index None 0) (viewRecordOpen record arg0Diff flip)
                   )
 
               Constructor _ _ subValueList ->
                   ( Just isClosed
                   , if isClosed then div [] [] else
-                      Html.map (Index None 0) (viewConstructorOpen subValueList)
+                      Html.map (Index None 0) (viewConstructorOpen subValueList arg0Diff flip)
                   )
 
           _ ->
             ( Just isClosed
-            , if isClosed then div [] [] else viewConstructorOpen valueList
+            , if isClosed then div [] [] else viewConstructorOpen valueList maybeDiff flip
             )
+
+    -- When nothing is expandable (maybeIsClosed == Nothing), the entire value is shown
+    -- inline in the summary text. Escalate any structural diff to Changed so the row
+    -- animates (e.g. Time.Posix, unit types, single-primitive constructors like Maybe.Just 42).
+    effectiveDiff =
+      case maybeIsClosed of
+        Nothing ->
+          case maybeDiff of
+            Just (DiffConstructor _) -> Just Changed
+            _ -> maybeDiff
+        Just _ -> maybeDiff
   in
-  div (leftPad maybeKey)
-    [ div [ onClick Toggle ] (lineStarter maybeKey maybeIsClosed description)
-    , openHtml
-    ]
+  case effectiveDiff of
+    Just Changed ->
+      Html.Keyed.node "div" (leftPad maybeKey)
+        [ ( if flip then "1" else "0"
+          , div [ class "elm-debugger-changed" ]
+              [ div [ onClick Toggle ] (lineStarter maybeKey maybeIsClosed description)
+              , openHtml
+              ]
+          )
+        ]
+    _ ->
+      div (leftPad maybeKey ++ [ changedClass effectiveDiff ])
+        [ div [ onClick Toggle ] (lineStarter maybeKey maybeIsClosed description)
+        , openHtml
+        ]
 
 
-viewConstructorOpen : List Expando -> Html Msg
-viewConstructorOpen valueList =
-  div [] (List.indexedMap viewConstructorEntry valueList)
+viewConstructorOpen : List Expando -> Maybe Diff -> Bool -> Html Msg
+viewConstructorOpen valueList maybeDiff flip =
+  div [] (List.indexedMap (\i v -> viewConstructorEntry i v (itemDiff i maybeDiff) flip) valueList)
 
 
-viewConstructorEntry : Int -> Expando -> Html Msg
-viewConstructorEntry index value =
-  Html.map (Index None index) (view (Just (String.fromInt index)) value)
+viewConstructorEntry : Int -> Expando -> Maybe Diff -> Bool -> Html Msg
+viewConstructorEntry index value maybeDiff flip =
+  Html.map (Index None index) (view (Just (String.fromInt index)) value maybeDiff flip)
 
 
 
